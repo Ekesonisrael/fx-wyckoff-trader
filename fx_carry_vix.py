@@ -7,6 +7,10 @@ Rule: Long top-3 highest-carry pairs IF VIX < 20.
       Monthly rebalance. Equal weight.
 
 Data: Dukascopy FX, FRED VIX (VIXCLS), FRED 3M interbank rates.
+
+Returns come from TWO sources:
+  1. Spot price change of the pairs held
+  2. Daily interest income = (annual rate differential %) / 100 / 252
 """
 
 import io
@@ -44,7 +48,6 @@ START = pd.Timestamp(2005, 1, 1)
 END = pd.Timestamp.now()
 
 SPREAD_PIPS = 1.5
-LOOKBACK_DAYS_FOR_RATE = 90  # use latest available rate
 
 RNG_SEED = 42
 BOOTSTRAP_ITERS = 5000
@@ -122,11 +125,6 @@ def load_prices():
 # CARRY SPREAD
 # ============================================================
 def build_carry_panel(rates, us_rate, panel):
-    """
-    For each pair, carry = (rate of non-USD leg) - (rate of USD leg).
-    Long the pair = long base, short quote.
-    """
-    # Align FRED series to daily and forward-fill (rates are monthly)
     daily_idx = panel.index
     us_d = us_rate.reindex(daily_idx, method='ffill')
 
@@ -135,13 +133,10 @@ def build_carry_panel(rates, us_rate, panel):
         r = rates[sym].reindex(daily_idx, method='ffill')
         if sym in carry.columns:
             if cfg['quote_is_usd']:
-                # e.g. EURUSD: long = long EUR, short USD
                 carry[sym] = r.values - us_d.values
             else:
-                # e.g. USDJPY: long = long USD, short JPY
                 carry[sym] = us_d.values - r.values
 
-    # Debug: show last row
     print("\n--- CARRY (last row, annualized %) ---")
     last = carry.iloc[-1].dropna()
     for sym, val in last.sort_values(ascending=False).items():
@@ -151,24 +146,16 @@ def build_carry_panel(rates, us_rate, panel):
 
 
 # ============================================================
-# SIGNAL + BACKTEST
+# BACKTEST (with carry income — the fix)
 # ============================================================
 def backtest(panel, carry, vix):
-    """
-    Monthly rebalance. Top-3 carry if VIX < 20, top-2 if 20<=VIX<25, flat if VIX>=25.
-    """
     daily_idx = panel.index
-
-    # Align VIX to daily index
     vix_d = vix.reindex(daily_idx, method='ffill')
 
-    # Month-start dates
     month_first = pd.Series(daily_idx).groupby([daily_idx.year, daily_idx.month]).min()
     rebalance_dates = pd.DatetimeIndex(month_first.values)
 
-    # Build target weights
     targets = pd.DataFrame(0.0, index=daily_idx, columns=panel.columns)
-
     for rd in rebalance_dates:
         if rd not in carry.index:
             continue
@@ -190,16 +177,22 @@ def backtest(panel, carry, vix):
         targets.loc[rd, top] = 1.0 / n
 
     targets = targets.replace(0, np.nan).ffill().fillna(0.0)
+    n_active = (targets.abs().sum(axis=1) > 0).sum()
+    print(f"\n  [DEBUG] active days: {n_active} / {len(targets)}")
 
-    n_days_active = (targets.abs().sum(axis=1) > 0).sum()
-    print(f"\n  [DEBUG] active days: {n_days_active} / {len(targets)}")
-
-    # Returns
+    # --- Spot price P&L ---
     rets = panel.pct_change()
     signal = targets.shift(1).fillna(0.0)
-    gross = (signal * rets).sum(axis=1)
+    spot_pnl = (signal * rets).sum(axis=1)
 
-    # Costs on rebalance days
+    # --- Carry income P&L (THE MISSING PIECE) ---
+    # Annual rate differential (%) / 100 / 252 = daily income fraction
+    carry_daily = carry.reindex(daily_idx, method='ffill').fillna(0.0) / 100.0 / 252.0
+    carry_income = (signal * carry_daily).sum(axis=1)
+
+    gross = spot_pnl + carry_income
+
+    # --- Costs on rebalance days ---
     cost = pd.Series(0.0, index=daily_idx)
     for sym in panel.columns:
         pip = PAIRS[sym]['pip']
@@ -210,11 +203,13 @@ def backtest(panel, carry, vix):
     net = gross - cost
     equity = (1 + net).cumprod() * 10000
 
-    print(f"  [DEBUG] gross sum: {gross.sum():+.4f}")
-    print(f"  [DEBUG] cost sum: {cost.sum():+.4f}")
-    print(f"  [DEBUG] net sum: {net.sum():+.4f}")
+    print(f"  [DEBUG] spot_pnl sum:    {spot_pnl.sum():+.4f}")
+    print(f"  [DEBUG] carry_income sum:{carry_income.sum():+.4f}")
+    print(f"  [DEBUG] gross sum:       {gross.sum():+.4f}")
+    print(f"  [DEBUG] cost sum:        {cost.sum():+.4f}")
+    print(f"  [DEBUG] net sum:         {net.sum():+.4f}")
 
-    return net, equity
+    return net, equity, spot_pnl, carry_income
 
 
 # ============================================================
@@ -298,12 +293,18 @@ def main():
 
     carry = build_carry_panel(rates, us_rate, panel)
 
-    net, equity = backtest(panel, carry, vix)
+    net, equity, spot_pnl, carry_income = backtest(panel, carry, vix)
     s = summarize(net)
     report(s)
 
     equity.to_csv('carry_equity.csv')
-    print("\nSaved carry_equity.csv")
+    pd.DataFrame({
+        'equity': equity,
+        'net': net,
+        'spot': spot_pnl,
+        'carry_income': carry_income,
+    }).to_csv('carry_daily.csv')
+    print("\nSaved carry_equity.csv and carry_daily.csv")
 
 
 if __name__ == "__main__":
