@@ -2,26 +2,18 @@
 """
 fx_xsmom.py — Cross-Sectional FX Momentum Backtester
 
-Hypothesis: Currencies that have outperformed over the past 3 months
-continue to outperform over the next month, relative to their peers.
+Reference: Menkhoff, Sarno, Schmeling & Schrimpf (2012), JFE 106(3).
 
-Reference: Menkhoff, Sarno, Schmeling & Schrimpf (2012), "Currency Momentum Strategies"
-           Journal of Financial Economics, 106(3), 660-684.
-           Eriksen (2019), "Cross-sectional return dispersion and currency momentum",
-           Journal of Empirical Finance, 53, 91-108.
+Rules:
+  - Universe: 7 major USD pairs
+  - Signal: 3-month cumulative return per pair, cross-sectionally ranked
+  - Rebalance: first trading day of each month
+  - Positions: long top 3, short bottom 3, equal weight
+  - Holding: one month
+  - Costs: 1.5 pip spread per side per trade
 
-Rules (fixed, no tuning):
-  - Universe: 7 major USD pairs (EURUSD, GBPUSD, AUDUSD, NZDUSD, USDCAD, USDCHF, USDJPY)
-  - Signal: 3-month cumulative return per pair (cross-sectional rank)
-  - Rebalance: First trading day of each month
-  - Positions: Long top 3, short bottom 3, equal weight
-  - Holding: One month
-  - Costs: 1.5 pip spread per side per trade (applied on rebalance)
-
-Data: Dukascopy daily bars, 2005-present.
-
-Pre-registered gates (do not change after seeing results):
-  - PASS if portfolio Sharpe > 0.5 AND monthly return CI lower bound > 0
+Gates (fixed before results):
+  - PASS if Sharpe_ann > 0.5 AND monthly CI lower bound > 0
   - FAIL otherwise
 """
 
@@ -44,38 +36,30 @@ SYMBOLS = {
     'USDJPY': ('USD/JPY', 'INSTRUMENT_FX_MAJORS_USD_JPY', 0.01),
 }
 
-# Parameters (fixed)
-LOOKBACK_MONTHS = 3          # formation period (Menkhoff et al. 2012)
-TOP_N = 3                    # long top 3, short bottom 3
+LOOKBACK_MONTHS = 3
+TOP_N = 3
 BOTTOM_N = 3
-REBALANCE_FREQ = 'MS'        # Month Start
 START_DATE = pd.Timestamp(2005, 1, 1)
 END_DATE = pd.Timestamp.now()
 
-# Costs
-SPREAD_PIPS = 1.5            # per side, per trade
-SLIPPAGE_PIPS = 0.0          # not modeled separately (spread captures it)
-
-# Portfolio
+SPREAD_PIPS = 1.5
 START_BALANCE = 10_000.0
-RISK_PER_TRADE = 0.01        # 1% of equity per leg (for sizing only)
-
-# Bootstrap
 RNG_SEED = 42
 BOOTSTRAP_ITERS = 5000
 
+
 # ============================================================
-# DATA LOADING
+# DATA
 # ============================================================
 def load_instruments():
     loaded = {}
     for sym, (name, attr, pip) in SYMBOLS.items():
         inst = getattr(inst_mod, attr, None)
         if inst is None:
-            print(f"  [SKIP] {sym} ({attr} not available)")
+            print(f"  [SKIP] {sym}")
             continue
         loaded[sym] = {'name': name, 'instrument': inst, 'pip_size': pip}
-        print(f"  [LOADED] {sym} ({name})")
+    print(f"  [LOADED] {len(loaded)} instruments")
     return loaded
 
 
@@ -95,221 +79,177 @@ def fetch_daily(instrument, start, end):
     return df
 
 
-# ============================================================
-# DATA ALIGNMENT
-# ============================================================
 def build_price_panel(instruments, start, end):
-    """Fetch all pairs, align to a common daily index."""
     frames = {}
     for sym, cfg in instruments.items():
         print(f"  Fetching {sym}...")
         df = fetch_daily(cfg['instrument'], start, end)
         if df.empty:
-            print(f"    [WARN] {sym} empty")
             continue
         frames[sym] = df['close']
-    if not frames:
-        return pd.DataFrame()
-
-    panel = pd.DataFrame(frames)
-    panel = panel.sort_index()
-
-    # Align to common dates (inner join)
-    panel = panel.dropna(how='all')
-    # Forward-fill gaps up to 3 days (weekends/holidays are not real gaps)
-    panel = panel.ffill(limit=3)
-    panel = panel.dropna()
-
-    print(f"  Panel: {panel.shape[0]} bars × {panel.shape[1]} pairs")
-    print(f"  Range: {panel.index[0].date()} → {panel.index[-1].date()}")
+    panel = pd.DataFrame(frames).sort_index()
+    panel = panel.ffill(limit=3).dropna()
+    print(f"  Panel: {panel.shape[0]} bars x {panel.shape[1]} pairs")
+    print(f"  Range: {panel.index[0].date()} -> {panel.index[-1].date()}")
     return panel
 
 
 # ============================================================
-# SIGNAL: cross-sectional momentum
+# SIGNALS
 # ============================================================
-def compute_cross_sectional_momentum(panel, lookback_months=3):
+def compute_signals(panel, lookback_months):
     """
-    Compute cross-sectional momentum signal at each month-end.
-    Returns a DataFrame of ranks per pair per rebalance date.
-    Rank 1 = strongest, Rank N = weakest.
+    Returns a DataFrame indexed by month-end dates, columns = symbols,
+    values = target weight (+1/N long, -1/N short, 0 flat).
+    Uses only data available as of that month-end.
     """
-    # Resample to month-end to get month-end prices
     month_end = panel.resample('ME').last()
+    print(f"  [DEBUG] month_end rows: {len(month_end)}")
 
-    # Compute cumulative return over lookback period
-    # Use the formula from Menkhoff et al.: product of (1+r) - 1 over past K months
     rets = month_end.pct_change()
     mom = (1 + rets).rolling(lookback_months).apply(np.prod, raw=True) - 1
+    mom = mom.shift(1)  # use info available at t to predict t+1
 
-    # Shift so that we use information available at month t to predict month t+1
-    mom = mom.shift(1)
-
-    # Cross-sectional rank (per row, rank from strongest to weakest)
-    ranks = mom.rank(axis=1, ascending=False, method='min')
-
-    return mom, ranks
-
-
-def generate_target_positions(ranks, n_long=3, n_short=3):
-    """
-    At each rebalance date, assign target weights.
-    +1/n for top n, -1/n for bottom n, 0 otherwise.
-    """
-    targets = pd.DataFrame(0.0, index=ranks.index, columns=ranks.columns)
-    for dt, row in ranks.iterrows():
+    targets = pd.DataFrame(0.0, index=mom.index, columns=mom.columns)
+    for dt, row in mom.iterrows():
         valid = row.dropna()
-        if len(valid) < (n_long + n_short):
+        if len(valid) < (TOP_N + BOTTOM_N):
             continue
-        top = valid.nsmallest(n_long).index
-        bottom = valid.nlargest(n_short).index
-        targets.loc[dt, top] = 1.0 / n_long
-        targets.loc[dt, bottom] = -1.0 / n_short
+        top = valid.nlargest(TOP_N).index
+        bottom = valid.nsmallest(BOTTOM_N).index
+        targets.loc[dt, top] = 1.0 / TOP_N
+        targets.loc[dt, bottom] = -1.0 / BOTTOM_N
+
+    n_nonzero = (targets.abs().sum(axis=1) > 0).sum()
+    print(f"  [DEBUG] month-end rows with positions: {n_nonzero}")
     return targets
 
 
 # ============================================================
 # BACKTEST
 # ============================================================
-def backtest_xsmom(panel, targets, pip_sizes, spread_pips=1.5):
+def backtest(panel, month_end_targets, pip_sizes, spread_pips):
     """
-    Walk forward day by day. At each rebalance date (month start),
-    close old positions and open new ones. Track daily P&L.
+    Align month-end targets to the first trading day AFTER each month-end.
+    Hold until the next rebalance. Track daily P&L.
     """
-    # Align targets to month start (first trading day of month)
     daily_index = panel.index
-    # Find first trading day of each month
-    month_starts = pd.Series(daily_index).groupby([daily_index.year, daily_index.month]).min()
-    month_start_dates = pd.DatetimeIndex(month_starts.values)
 
-    # Build a daily target matrix
-    daily_targets = pd.DataFrame(0.0, index=daily_index, columns=panel.columns)
-    for dt in month_start_dates:
-        if dt in targets.index:
-            daily_targets.loc[dt] = targets.loc[dt]
-    # Forward-fill between rebalances
-    daily_targets = daily_targets.replace(0, np.nan).ffill().fillna(0.0)
+    # Build a daily target frame, one row per month-end target
+    # First, find the trading-day version of each month-end target
+    aligned = pd.DataFrame(np.nan, index=daily_index, columns=panel.columns)
 
-    # Compute daily returns (long/short P&L)
+    for me_dt, row in month_end_targets.iterrows():
+        future = daily_index[daily_index > me_dt]
+        if len(future) == 0:
+            continue
+        apply_from = future[0]
+        aligned.loc[apply_from] = row.values
+
+    # Forward-fill across trading days (targets persist until next rebalance)
+    aligned = aligned.ffill().fillna(0.0)
+
+    n_nonzero = (aligned.abs().sum(axis=1) > 0).sum()
+    print(f"  [DEBUG] trading days with nonzero positions: {n_nonzero} / {len(aligned)}")
+
+    # Daily returns of the price panel
     daily_rets = panel.pct_change()
 
-    # Position P&L (signal from previous day's close, applied to today's return)
-    signal = daily_targets.shift(1).fillna(0.0)
+    # Signal = yesterday's target applied to today's return
+    signal = aligned.shift(1).fillna(0.0)
     gross_pnl = (signal * daily_rets).sum(axis=1)
 
-    # Transaction costs: applied on rebalance days
-    turnover = daily_targets.diff().abs().sum(axis=1)
-    # Costs in pips converted to return terms
-    # We approximate: cost = turnover * (spread_pips / 10000) for each leg
-    # But since pairs have different pip sizes (JPY=0.01), we compute per-pair
+    # Costs on rebalance days (turnover)
     cost_series = pd.Series(0.0, index=daily_index)
     for sym in panel.columns:
         pip = pip_sizes[sym]
-        # spread in price terms
         spread_price = spread_pips * pip
-        # cost per unit turnover for this pair
-        pair_turnover = daily_targets[sym].diff().abs()
-        # The turnover is in weight units. We approximate position notional as weight * 1
-        # (weights are fractions of equity). So cost in return terms = turnover * spread_price / price
+        turnover = aligned[sym].diff().abs()
         price = panel[sym]
-        cost_series += (pair_turnover * spread_price / price).fillna(0.0)
+        cost_series += (turnover * spread_price / price).fillna(0.0)
 
     net_pnl = gross_pnl - cost_series
     equity = (1 + net_pnl).cumprod() * START_BALANCE
 
-    return {
-        'gross_pnl': gross_pnl,
-        'cost': cost_series,
-        'net_pnl': net_pnl,
-        'equity': equity,
-    }
+    print(f"  [DEBUG] gross PnL sum: {gross_pnl.sum():+.4f}")
+    print(f"  [DEBUG] cost sum: {cost_series.sum():+.4f}")
+    print(f"  [DEBUG] net PnL sum: {net_pnl.sum():+.4f}")
+
+    return {'gross_pnl': gross_pnl, 'cost': cost_series, 'net_pnl': net_pnl, 'equity': equity}
 
 
 # ============================================================
 # METRICS
 # ============================================================
-def summarize_backtest(results):
+def summarize(results):
     pnl = results['net_pnl'].dropna()
     if len(pnl) < 100:
         return {'n': 0}
 
     n = len(pnl)
-    mean_daily = pnl.mean()
-    std_daily = pnl.std()
-    sharpe_daily = mean_daily / std_daily if std_daily > 0 else 0.0
-    sharpe_ann = sharpe_daily * math.sqrt(252)
+    mean_d = pnl.mean()
+    std_d = pnl.std()
+    sharpe_ann = (mean_d / std_d) * math.sqrt(252) if std_d > 0 else 0.0
 
-    # Monthly returns
     monthly = (1 + pnl).resample('ME').prod() - 1
-    monthly_mean = monthly.mean()
-    monthly_std = monthly.std()
-    sharpe_monthly = (monthly_mean / monthly_std * math.sqrt(12)) if monthly_std > 0 else 0.0
+    m_mean = monthly.mean()
+    m_std = monthly.std()
+    sharpe_monthly = (m_mean / m_std * math.sqrt(12)) if m_std > 0 else 0.0
 
-    # Bootstrap CI on monthly returns
     rng = np.random.default_rng(RNG_SEED)
     boots = monthly.values[rng.integers(0, len(monthly), size=(BOOTSTRAP_ITERS, len(monthly)))].mean(axis=1)
     ci_lo = float(np.percentile(boots, 2.5))
     ci_hi = float(np.percentile(boots, 97.5))
 
-    total_return = (1 + pnl).prod() - 1
+    total_ret = (1 + pnl).prod() - 1
     years = (pnl.index[-1] - pnl.index[0]).days / 365.25
-    ann_return = (1 + total_return) ** (1 / years) - 1 if years > 0 else 0.0
+    ann_ret = (1 + total_ret) ** (1 / years) - 1 if years > 0 else 0.0
 
-    # Drawdown
     eq = (1 + pnl).cumprod()
     peak = eq.cummax()
-    dd = (eq - peak) / peak
-    max_dd = dd.min()
+    max_dd = ((eq - peak) / peak).min()
 
     return {
         'n_days': n,
         'sharpe_ann': round(sharpe_ann, 3),
         'sharpe_monthly': round(sharpe_monthly, 3),
-        'monthly_mean': round(monthly_mean, 6),
-        'monthly_std': round(monthly_std, 6),
-        'ci95_lo': round(ci_lo, 6),
-        'ci95_hi': round(ci_hi, 6),
-        'total_return_pct': round(total_return * 100, 2),
-        'ann_return_pct': round(ann_return * 100, 2),
+        'monthly_mean_pct': round(m_mean * 100, 4),
+        'monthly_std_pct': round(m_std * 100, 4),
+        'ci95_lo_pct': round(ci_lo * 100, 4),
+        'ci95_hi_pct': round(ci_hi * 100, 4),
+        'total_return_pct': round(total_ret * 100, 2),
+        'ann_return_pct': round(ann_ret * 100, 2),
         'max_dd_pct': round(max_dd * 100, 2),
-        'avg_cost_bps': round(results['cost'].mean() * 10000, 2),
     }
 
 
-# ============================================================
-# REPORT
-# ============================================================
-def print_report(summary, results):
+def print_report(summary):
     print("\n" + "=" * 60)
     print("     CROSS-SECTIONAL FX MOMENTUM — BACKTEST REPORT")
     print("=" * 60)
-
     if summary.get('n_days', 0) < 100:
         print("Insufficient data.")
         return
+    print(f"  Sharpe (ann.):     {summary['sharpe_ann']:+.3f}")
+    print(f"  Sharpe (monthly):  {summary['sharpe_monthly']:+.3f}")
+    print(f"  Monthly mean:      {summary['monthly_mean_pct']:+.4f}%")
+    print(f"  Monthly std:       {summary['monthly_std_pct']:.4f}%")
+    print(f"  Monthly CI95:      [{summary['ci95_lo_pct']:+.4f}%, {summary['ci95_hi_pct']:+.4f}%]")
+    print(f"  Total return:      {summary['total_return_pct']:+.2f}%")
+    print(f"  Annualized return: {summary['ann_return_pct']:+.2f}%")
+    print(f"  Max drawdown:      {summary['max_dd_pct']:.2f}%")
 
-    print(f"  Sharpe (ann.):       {summary['sharpe_ann']:+.3f}")
-    print(f"  Sharpe (monthly):    {summary['sharpe_monthly']:+.3f}")
-    print(f"  Monthly mean:        {summary['monthly_mean']*100:+.4f}%")
-    print(f"  Monthly std:         {summary['monthly_std']*100:.4f}%")
-    print(f"  Monthly CI95:        [{summary['ci95_lo']*100:+.4f}%, {summary['ci95_hi']*100:+.4f}%]")
-    print(f"  Total return:        {summary['total_return_pct']:+.2f}%")
-    print(f"  Annualized return:   {summary['ann_return_pct']:+.2f}%")
-    print(f"  Max drawdown:        {summary['max_dd_pct']:.2f}%")
-    print(f"  Avg daily cost:      {summary['avg_cost_bps']:.2f} bps")
-
-    # Verdict
     print("\n--- VERDICT ---")
     sharpe_ok = summary['sharpe_ann'] > 0.5
-    ci_ok = summary['ci95_lo'] > 0
+    ci_ok = summary['ci95_lo_pct'] > 0
     if sharpe_ok and ci_ok:
-        print("  ✅ PASS — strategy shows positive risk-adjusted returns.")
+        print("  PASS — strategy shows positive risk-adjusted returns.")
     elif not sharpe_ok and not ci_ok:
-        print("  ❌ FAIL — Sharpe ≤ 0.5 and CI lower bound ≤ 0.")
+        print("  FAIL — Sharpe <= 0.5 and CI lower bound <= 0.")
     elif not sharpe_ok:
-        print(f"  ❌ FAIL — Sharpe {summary['sharpe_ann']:.3f} ≤ 0.5")
+        print(f"  FAIL — Sharpe {summary['sharpe_ann']:.3f} <= 0.5")
     else:
-        print(f"  ❌ FAIL — Monthly CI lower bound {summary['ci95_lo']*100:.4f}% ≤ 0")
+        print(f"  FAIL — Monthly CI lower bound {summary['ci95_lo_pct']:.4f}% <= 0")
     print("=" * 60)
 
 
@@ -319,37 +259,29 @@ def print_report(summary, results):
 def main():
     print("=" * 60)
     print("  FX CROSS-SECTIONAL MOMENTUM BACKTEST")
-    print(f"  Formation: {LOOKBACK_MONTHS} months | Long: {TOP_N} | Short: {BOTTOM_N}")
+    print(f"  Formation: {LOOKBACK_MONTHS}M | Long: {TOP_N} | Short: {BOTTOM_N}")
     print("=" * 60)
 
     instruments = load_instruments()
     if len(instruments) < 6:
-        print("Not enough instruments. Aborting.")
+        print("Not enough instruments.")
         return
 
     panel = build_price_panel(instruments, START_DATE, END_DATE)
     if panel.empty:
-        print("No data. Aborting.")
+        print("No data.")
         return
 
-    # Compute signals
-    mom, ranks = compute_cross_sectional_momentum(panel, LOOKBACK_MONTHS)
-    targets = generate_target_positions(ranks, TOP_N, BOTTOM_N)
-
-    print(f"\n  Rebalance dates: {len(targets)}")
-    if len(targets) == 0:
-        print("No rebalance dates. Aborting.")
+    targets = compute_signals(panel, LOOKBACK_MONTHS)
+    if (targets.abs().sum(axis=1) > 0).sum() == 0:
+        print("No rebalance dates produced positions. Aborting.")
         return
 
-    # Pip sizes
     pip_sizes = {sym: cfg['pip_size'] for sym, cfg in instruments.items()}
+    results = backtest(panel, targets, pip_sizes, SPREAD_PIPS)
+    summary = summarize(results)
+    print_report(summary)
 
-    # Backtest
-    results = backtest_xsmom(panel, targets, pip_sizes, spread_pips=SPREAD_PIPS)
-    summary = summarize_backtest(results)
-    print_report(summary, results)
-
-    # Save
     pd.DataFrame({
         'equity': results['equity'],
         'net_pnl': results['net_pnl'],
