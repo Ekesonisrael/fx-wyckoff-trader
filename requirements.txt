@@ -1,0 +1,4 @@
+pandas
+numpy
+dukascopy-python
+requests
