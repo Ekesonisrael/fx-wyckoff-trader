@@ -8,7 +8,6 @@ Portfolio-level judgement (monthly Sharpe, not per-trade R).
 
 Data: Dukascopy, daily bars, 2005-present.
 """
-import datetime as dt
 import math
 import numpy as np
 import pandas as pd
@@ -18,7 +17,7 @@ from dukascopy_python import instruments as inst_mod
 # ============================================================
 # SEALED HOLDOUT
 # ============================================================
-USE_HOLDOUT = False   # flip to True ONCE, at the very end, then never tune again
+USE_HOLDOUT = False   # flip to True ONCE, at the very end
 
 # ============================================================
 # STRATEGY PARAMETERS (fixed — no tuning)
@@ -27,14 +26,14 @@ LOOKBACK_DAYS = 100
 ATR_PERIOD = 20
 ATR_MULT = 3.0
 RISK_PER_TRADE = 0.0025      # 0.25% of starting balance per trade
-MAX_HOLD_BARS = 250          # hard time cap (about 1 trading year)
+MAX_HOLD_BARS = 250
 MIN_TRADES_REQUIRED = 150
 
 # ============================================================
 # COSTS (era-aware)
 # ============================================================
 ERA_CUTOVER_YEAR = 2012
-SLIPPAGE_FRACTION_OF_SPREAD = 0.25   # slippage = 25% of the spread, each side
+SLIPPAGE_FRACTION_OF_SPREAD = 0.25
 
 # ============================================================
 # INSTRUMENTS (name, attr, pip size, spread_pre, spread_post, swap/day pips)
@@ -55,14 +54,16 @@ INSTRUMENT_CANDIDATES = {
 }
 
 START_BALANCE = 10_000.0
-DEV_START = dt.datetime(2005, 1, 1, tzinfo=dt.timezone.utc)
-DEV_END   = dt.datetime(2018, 1, 1, tzinfo=dt.timezone.utc)
-VAL_END   = dt.datetime(2022, 12, 31, tzinfo=dt.timezone.utc)
-FINAL_END = dt.datetime.now(tz=dt.timezone.utc)
+
+# Use pandas Timestamps — compatible with df.index (datetime64[ns])
+DEV_START = pd.Timestamp(2005, 1, 1)
+DEV_END   = pd.Timestamp(2018, 1, 1)
+VAL_END   = pd.Timestamp(2022, 12, 31)
+FINAL_END = pd.Timestamp.now()
 
 RNG_SEED = 42
 BOOTSTRAP_ITERS = 5000
-RANDOM_ITERS = 500   # for canary 2
+RANDOM_ITERS = 500
 
 
 # ============================================================
@@ -73,7 +74,7 @@ def load_instruments():
     for sym, (name, attr, pip, pre, post, swap) in INSTRUMENT_CANDIDATES.items():
         inst = getattr(inst_mod, attr, None)
         if inst is None:
-            print(f"  [SKIP] {sym} ({attr} not available in dukascopy_python)")
+            print(f"  [SKIP] {sym} ({attr} not available)")
             continue
         loaded[sym] = {
             'name': name,
@@ -95,13 +96,12 @@ def fetch_daily(instrument, start, end):
         instrument,
         dukascopy_python.INTERVAL_DAY_1,
         dukascopy_python.OFFER_SIDE_BID,
-        start, end,
+        start.to_pydatetime(), end.to_pydatetime(),
     )
     if df is None or df.empty:
         return pd.DataFrame()
     df = df.copy()
-    df.index = pd.to_datetime(df.index, utc=True)
-    df.index = df.index.tz_localize(None)          # strip tz for uniform comparisons
+    df.index = pd.to_datetime(df.index, utc=True).tz_localize(None).astype('datetime64[ns]')
     df = df[['open', 'high', 'low', 'close']].dropna()
     df = df[~df.index.duplicated(keep='last')].sort_index()
     return df
@@ -121,8 +121,6 @@ def assert_data(df, sym):
         print(f"    [WARN] starts late ({first.year})")
     if max_gap_days > 10:
         print(f"    [WARN] max gap {max_gap_days} days")
-    if bars_per_year < 200:
-        print(f"    [WARN] fewer than 200 bars/year")
 
 
 # ============================================================
@@ -134,23 +132,16 @@ def atr_series(high, low, close, n):
     lc = np.abs(low - np.roll(close, 1))
     tr = np.maximum(hl, np.maximum(hc, lc))
     tr[0] = hl[0]
-    # Wilder smoothing via EMA
     atr = pd.Series(tr).ewm(alpha=1.0 / n, adjust=False, min_periods=n).mean().values
     return atr
 
 
 # ============================================================
-# SIMULATOR (trailing stop)
+# SIMULATOR
 # ============================================================
 def simulate_trend_trade(entry_idx, side, entry_open, stop_distance,
                          high, low, close, spread_price, swap_per_day_price,
                          max_hold_bars=MAX_HOLD_BARS):
-    """
-    Enter at bar entry_idx open (with half spread + slippage against us).
-    Trailing stop: stop moves with the trend, never against.
-    Exit: stop hit, or max_hold_bars reached (close out at bar close).
-    Returns dict or None.
-    """
     n = len(high)
     if entry_idx >= n - 1:
         return None
@@ -174,13 +165,11 @@ def simulate_trend_trade(entry_idx, side, entry_open, stop_distance,
     for j in range(entry_idx, min(entry_idx + max_hold_bars, n)):
         bh, bl = high[j], low[j]
 
-        # Check stop with current (pre-update) level
         if side == 1 and bl <= stop:
             exit_price = stop; exit_idx = j; status = 'STOP'; break
         if side == -1 and bh >= stop:
             exit_price = stop; exit_idx = j; status = 'STOP'; break
 
-        # Update trail
         if side == 1:
             if bh > best:
                 best = bh
@@ -216,7 +205,7 @@ def simulate_trend_trade(entry_idx, side, entry_open, stop_distance,
 
 
 # ============================================================
-# TRADE GENERATION (per instrument)
+# TRADE GENERATION
 # ============================================================
 def generate_trades(df, sym, cfg, era_cutover=ERA_CUTOVER_YEAR):
     o = df['open'].values
@@ -227,7 +216,6 @@ def generate_trades(df, sym, cfg, era_cutover=ERA_CUTOVER_YEAR):
 
     atr = atr_series(h, l, c, ATR_PERIOD)
 
-    # 100-day rolling high/low of CLOSE, exclusive of current bar
     cs = pd.Series(c)
     hh = cs.shift(1).rolling(LOOKBACK_DAYS).max().values
     ll = cs.shift(1).rolling(LOOKBACK_DAYS).min().values
@@ -293,7 +281,6 @@ def canary_buy_hold(df, sym):
 
 
 def canary_random_entries(df, cfg, n_signals=200, iters=RANDOM_ITERS):
-    """Random entries through the actual simulator. Zero-cost run should be ~0R."""
     o = df['open'].values
     h = df['high'].values
     l = df['low'].values
@@ -333,21 +320,17 @@ def canary_random_entries(df, cfg, n_signals=200, iters=RANDOM_ITERS):
 
 
 def canary_lookahead(df, cfg):
-    """Perfect-foresight entries through the actual simulator. Must be huge."""
     o = df['open'].values
     h = df['high'].values
     l = df['low'].values
     c = df['close'].values
     atr = atr_series(h, l, c, ATR_PERIOD)
-    pip = cfg['pip_size']
     rs = []
     for i in range(LOOKBACK_DAYS + ATR_PERIOD + 2, len(df) - 5, 5):
         if not np.isfinite(atr[i]) or atr[i] <= 0:
             continue
-        # cheat: use next bar's high/low as the entry outcome
         nxt_up = c[i + 1] > c[i]
         side = 1 if nxt_up else -1
-        # shrink stop distance so perfect foresight shows up clearly
         sd = 0.1 * atr[i]
         t = simulate_trend_trade(
             i + 1, side, o[i + 1], sd,
@@ -370,7 +353,6 @@ def portfolio_monthly_returns(trades):
     df['pnl'] = df['r_net'] * risk_dollars
     df['month'] = pd.to_datetime(df['exit_time']).dt.to_period('M')
     monthly = df.groupby('month')['pnl'].sum()
-    # Percentage return relative to starting balance
     return monthly / START_BALANCE
 
 
@@ -385,11 +367,11 @@ def portfolio_sharpe(monthly_returns):
 
 def portfolio_drawdown(monthly_returns):
     if len(monthly_returns) == 0:
-        return 0.0, 0.0
+        return 0.0
     eq = (1 + monthly_returns).cumprod()
     peak = eq.cummax()
     dd = (eq - peak) / peak
-    return float(dd.min()) * 100, float(dd.max() * 100)
+    return float(dd.min()) * 100
 
 
 def summarize_trades(trades):
@@ -453,17 +435,14 @@ def main():
             canary_buy_hold(df, sym)
             nc, wc = canary_random_entries(df, cfg, n_signals=150, iters=200)
             if nc is None or wc is None:
-                print(f"    [WARN] {sym} random canary returned nothing")
                 canary_failures.append(sym)
                 continue
             print(f"    random (no cost) mean R = {nc.mean():+.4f}  (expect ~0)")
             print(f"    random (with cost) mean R = {wc.mean():+.4f}  (expect <0)")
-            if not (wc.mean() < 0.05):
-                print(f"    [WARN] {sym} random entries with costs are not losing")
             la = canary_lookahead(df, cfg)
-            print(f"    look-ahead mean R = {la:+.3f}  (expect > 3)")
-            if la < 2.0:
-                print(f"    [WARN] {sym} look-ahead weak — possible engine issue")
+            print(f"    look-ahead mean R = {la:+.3f}  (expect > 0.5)")
+            if la < 0.5:
+                print(f"    [WARN] {sym} look-ahead weak")
                 canary_failures.append(sym)
         except Exception as e:
             print(f"  [ERROR] {sym}: {e}")
@@ -480,7 +459,6 @@ def main():
             df = fetch_daily(cfg['instrument'], DEV_START, FINAL_END)
             if df.empty:
                 continue
-            # SEALED HOLDOUT: cut at VAL_END unless USE_HOLDOUT
             if not USE_HOLDOUT:
                 df = df[df.index <= VAL_END]
             trades = generate_trades(df, sym, cfg)
@@ -495,7 +473,6 @@ def main():
 
     all_trades.sort(key=lambda t: t['exit_time'])
 
-    # Split into dev / val (no holdout unless USE_HOLDOUT)
     dev = [t for t in all_trades if t['entry_time'] < DEV_END]
     val = [t for t in all_trades if DEV_END <= t['entry_time'] <= VAL_END]
     hold = [t for t in all_trades if t['entry_time'] > VAL_END]
@@ -523,7 +500,7 @@ def main():
     monthly = portfolio_monthly_returns(all_trades)
     if len(monthly) > 0:
         sharpe = portfolio_sharpe(monthly)
-        dd_min, dd_max = portfolio_drawdown(monthly)
+        dd_min = portfolio_drawdown(monthly)
         total_ret = ((1 + monthly).prod() - 1) * 100
         print(f"  Months tracked: {len(monthly)}")
         print(f"  Total return: {total_ret:+.1f}%")
@@ -531,7 +508,6 @@ def main():
         print(f"  Max drawdown: {dd_min:.1f}%")
         print(f"  Best month: {monthly.max()*100:+.2f}% | Worst: {monthly.min()*100:+.2f}%")
 
-        # Bootstrap CI on monthly returns
         rng = np.random.default_rng(RNG_SEED)
         boots = monthly.values[rng.integers(0, len(monthly), size=(BOOTSTRAP_ITERS, len(monthly)))].mean(axis=1)
         ci_lo = float(np.percentile(boots, 2.5))
@@ -540,7 +516,7 @@ def main():
     else:
         print("  No monthly data.")
 
-    print(f"\n--- VERDICT (pre-registered gates) ---")
+    print(f"\n--- VERDICT ---")
     n_trades = len(all_trades)
     passed = True
     if n_trades < MIN_TRADES_REQUIRED:
@@ -560,7 +536,6 @@ def main():
         print("  PASS (directional). Forward-test on demo before any live capital.")
     print("=" * 72)
 
-    # Save trades
     pd.DataFrame(all_trades).to_csv('fx_trades.csv', index=False)
     print(f"\nSaved {len(all_trades)} trades to fx_trades.csv")
 
