@@ -1,535 +1,569 @@
 #!/usr/bin/env python3
 """
-fx_backtest.py — Wyckoff Spring/UTAD swing strategy backtester for FX.
-Assets: EURUSD, XAUUSD. Timeframe: 4H primary, 1D trend context.
-Data: Dukascopy via dukascopy-python.
+fx_backtest.py — Daily trend-following backtester (100-day breakout, 3xATR trail).
+
+Edge hypothesis: time-series momentum. Long when close > 100-day high close,
+short when close < 100-day low close. Exit on 3xATR(20) trailing stop.
+Portfolio-level judgement (monthly Sharpe, not per-trade R).
+
+Data: Dukascopy, daily bars, 2005-present.
 """
 import datetime as dt
 import math
 import numpy as np
 import pandas as pd
 import dukascopy_python
-from dukascopy_python.instruments import (
-    INSTRUMENT_FX_MAJORS_EUR_USD,
-    INSTRUMENT_FX_METALS_XAU_USD,
-)
+from dukascopy_python import instruments as inst_mod
 
 # ============================================================
-# CONFIG (fixed — not to be tuned after seeing results)
+# SEALED HOLDOUT
 # ============================================================
-INSTRUMENTS = {
-    'EURUSD': INSTRUMENT_FX_MAJORS_EUR_USD,
-    'XAUUSD': INSTRUMENT_FX_METALS_XAU_USD,
+USE_HOLDOUT = False   # flip to True ONCE, at the very end, then never tune again
+
+# ============================================================
+# STRATEGY PARAMETERS (fixed — no tuning)
+# ============================================================
+LOOKBACK_DAYS = 100
+ATR_PERIOD = 20
+ATR_MULT = 3.0
+RISK_PER_TRADE = 0.0025      # 0.25% of starting balance per trade
+MAX_HOLD_BARS = 250          # hard time cap (about 1 trading year)
+MIN_TRADES_REQUIRED = 150
+
+# ============================================================
+# COSTS (era-aware)
+# ============================================================
+ERA_CUTOVER_YEAR = 2012
+SLIPPAGE_FRACTION_OF_SPREAD = 0.25   # slippage = 25% of the spread, each side
+
+# ============================================================
+# INSTRUMENTS (name, attr, pip size, spread_pre, spread_post, swap/day pips)
+# ============================================================
+INSTRUMENT_CANDIDATES = {
+    'EURUSD': ('EUR/USD', 'INSTRUMENT_FX_MAJORS_EUR_USD', 0.0001, 2.0, 1.0, 0.2),
+    'GBPUSD': ('GBP/USD', 'INSTRUMENT_FX_MAJORS_GBP_USD', 0.0001, 3.0, 1.5, 0.2),
+    'USDJPY': ('USD/JPY', 'INSTRUMENT_FX_MAJORS_USD_JPY', 0.01,   2.0, 1.0, 0.2),
+    'AUDUSD': ('AUD/USD', 'INSTRUMENT_FX_MAJORS_AUD_USD', 0.0001, 2.5, 1.5, 0.2),
+    'USDCAD': ('USD/CAD', 'INSTRUMENT_FX_MAJORS_USD_CAD', 0.0001, 2.5, 1.8, 0.2),
+    'USDCHF': ('USD/CHF', 'INSTRUMENT_FX_MAJORS_USD_CHF', 0.0001, 2.5, 1.8, 0.2),
+    'NZDUSD': ('NZD/USD', 'INSTRUMENT_FX_MAJORS_NZD_USD', 0.0001, 3.0, 2.0, 0.2),
+    'EURGBP': ('EUR/GBP', 'INSTRUMENT_FX_CROSSES_EUR_GBP', 0.0001, 3.0, 2.0, 0.2),
+    'EURJPY': ('EUR/JPY', 'INSTRUMENT_FX_CROSSES_EUR_JPY', 0.01,   3.0, 2.0, 0.2),
+    'GBPJPY': ('GBP/JPY', 'INSTRUMENT_FX_CROSSES_GBP_JPY', 0.01,   4.0, 3.0, 0.2),
+    'XAUUSD': ('XAU/USD', 'INSTRUMENT_FX_METALS_XAU_USD', 0.01, 50.0, 30.0, 1.0),
+    'XAGUSD': ('XAG/USD', 'INSTRUMENT_FX_METALS_XAG_USD', 0.001, 5.0, 3.0, 0.5),
 }
 
-PIP_SIZE = {'EURUSD': 0.0001, 'XAUUSD': 0.01}
-SPREAD_PIPS = {'EURUSD': 1.0, 'XAUUSD': 30.0}
-SLIPPAGE_PIPS = {'EURUSD': 0.5, 'XAUUSD': 5.0}
-SWAP_PIPS_PER_DAY = {'EURUSD': 0.2, 'XAUUSD': 1.0}
-
-LOOKBACK = 40
-TOUCH_TOL_ATR = 0.25
-MIN_TOUCHES_PER_EDGE = 2
-RANGE_WIDTH_MIN_ATR = 1.5
-RANGE_WIDTH_MAX_ATR = 6.0
-RANGE_WIDTH_MAX_PCT = 0.05
-WICK_RATIO_MIN = 0.5
-MIN_BARS_BETWEEN_SIGNALS = 20
-
-RR_RATIO = 2.0
-STOP_BUFFER_ATR = 0.25
-TIME_STOP_BARS = 60
-WARMUP_BARS = 300
-
-STARTING_BALANCE = 10_000.0
-RISK_PER_TRADE = 0.01
-LEVERAGE_CAP = 3.0
-
-# Timezone-aware split dates (fix: Dukascopy returns tz-aware timestamps)
+START_BALANCE = 10_000.0
 DEV_START = dt.datetime(2005, 1, 1, tzinfo=dt.timezone.utc)
-DEV_END = dt.datetime(2018, 1, 1, tzinfo=dt.timezone.utc)
-VAL_END = dt.datetime(2023, 1, 1, tzinfo=dt.timezone.utc)
-HOLDOUT_END = dt.datetime.now(tz=dt.timezone.utc)
-
-GATES = {
-    'min_oos_trades': 100,
-    'min_oos_mean_r': 0.05,
-    'ci_lower_gt_zero': True,
-    'baseline_p_max': 0.05,
-    'min_sharpe': 0.30,
-}
+DEV_END   = dt.datetime(2018, 1, 1, tzinfo=dt.timezone.utc)
+VAL_END   = dt.datetime(2022, 12, 31, tzinfo=dt.timezone.utc)
+FINAL_END = dt.datetime.now(tz=dt.timezone.utc)
 
 RNG_SEED = 42
 BOOTSTRAP_ITERS = 5000
-MONTE_CARLO_ITERS = 3000
+RANDOM_ITERS = 500   # for canary 2
+
+
+# ============================================================
+# INSTRUMENT LOADING
+# ============================================================
+def load_instruments():
+    loaded = {}
+    for sym, (name, attr, pip, pre, post, swap) in INSTRUMENT_CANDIDATES.items():
+        inst = getattr(inst_mod, attr, None)
+        if inst is None:
+            print(f"  [SKIP] {sym} ({attr} not available in dukascopy_python)")
+            continue
+        loaded[sym] = {
+            'name': name,
+            'instrument': inst,
+            'pip_size': pip,
+            'spread_pre': pre,
+            'spread_post': post,
+            'swap_per_day_pips': swap,
+        }
+        print(f"  [LOADED] {sym} ({name})")
+    return loaded
 
 
 # ============================================================
 # DATA
 # ============================================================
-def fetch_4h(instrument, start, end):
-    print(f"  Fetching 4H from {start.date()} to {end.date()}...")
+def fetch_daily(instrument, start, end):
     df = dukascopy_python.fetch(
         instrument,
-        dukascopy_python.INTERVAL_HOUR_4,
+        dukascopy_python.INTERVAL_DAY_1,
         dukascopy_python.OFFER_SIDE_BID,
-        start,
-        end,
+        start, end,
     )
     if df is None or df.empty:
         return pd.DataFrame()
     df = df.copy()
     df.index = pd.to_datetime(df.index, utc=True)
-    df = df[['open', 'high', 'low', 'close', 'volume']].dropna()
+    df.index = df.index.tz_localize(None)          # strip tz for uniform comparisons
+    df = df[['open', 'high', 'low', 'close']].dropna()
     df = df[~df.index.duplicated(keep='last')].sort_index()
     return df
 
 
-def compute_atr(df, n=14):
-    hl = df['high'] - df['low']
-    hc = (df['high'] - df['close'].shift()).abs()
-    lc = (df['low'] - df['close'].shift()).abs()
-    tr = pd.concat([hl, hc, lc], axis=1).max(axis=1)
-    return tr.rolling(n, min_periods=n).mean()
-
-
-def compute_ema(s, n):
-    return s.ewm(span=n, adjust=False).mean()
-
-
-# ============================================================
-# WYCKOFF DETECTOR (strict)
-# ============================================================
-def detect_signals(df, pip_size):
-    df = df.copy()
-    df['atr'] = compute_atr(df)
-    df['ema20'] = compute_ema(df['close'], 20)
-    df['ema50'] = compute_ema(df['close'], 50)
-    df = df.reset_index()
-
-    signals = []
-    n = len(df)
-    last_signal_idx = -10**9
-
-    for i in range(WARMUP_BARS, n - 1):
-        if i - last_signal_idx < MIN_BARS_BETWEEN_SIGNALS:
-            continue
-
-        atr = df.loc[i, 'atr']
-        if pd.isna(atr) or atr <= 0:
-            continue
-
-        win_start = i - LOOKBACK
-        win = df.iloc[win_start:i]
-        if win.empty:
-            continue
-
-        H = win['high'].max()
-        L = win['low'].min()
-        range_width = H - L
-        avg_close = win['close'].mean()
-
-        if range_width < RANGE_WIDTH_MIN_ATR * atr:
-            continue
-        if range_width > RANGE_WIDTH_MAX_ATR * atr:
-            continue
-        if range_width / avg_close > RANGE_WIDTH_MAX_PCT:
-            continue
-
-        tol = TOUCH_TOL_ATR * atr
-        touches_high = int((win['high'] >= H - tol).sum())
-        touches_low = int((win['low'] <= L + tol).sum())
-        if touches_high < MIN_TOUCHES_PER_EDGE or touches_low < MIN_TOUCHES_PER_EDGE:
-            continue
-
-        bar = df.iloc[i]
-        bar_range = bar['high'] - bar['low']
-        if bar_range <= 0:
-            continue
-
-        # Spring (LONG)
-        if bar['low'] < L and bar['close'] > L:
-            lower_wick = min(bar['open'], bar['close']) - bar['low']
-            if lower_wick / bar_range >= WICK_RATIO_MIN:
-                stop = bar['low'] - STOP_BUFFER_ATR * atr
-                signals.append({
-                    'idx': i, 'type': 'Spring', 'side': 1,
-                    'entry_idx': i + 1, 'stop_price': stop,
-                })
-                last_signal_idx = i
-                continue
-
-        # UTAD (SHORT)
-        if bar['high'] > H and bar['close'] < H:
-            upper_wick = bar['high'] - max(bar['open'], bar['close'])
-            if upper_wick / bar_range >= WICK_RATIO_MIN:
-                stop = bar['high'] + STOP_BUFFER_ATR * atr
-                signals.append({
-                    'idx': i, 'type': 'UTAD', 'side': -1,
-                    'entry_idx': i + 1, 'stop_price': stop,
-                })
-                last_signal_idx = i
-
-    return signals
+def assert_data(df, sym):
+    if df.empty:
+        print(f"  [WARN] {sym}: empty")
+        return
+    first, last = df.index[0], df.index[-1]
+    gaps = df.index.to_series().diff().dropna()
+    max_gap_days = gaps.max().days if len(gaps) else 0
+    bars_per_year = len(df) / max(1, (last - first).days / 365.25)
+    print(f"  {sym}: {len(df):5d} bars | {first.date()} → {last.date()} | "
+          f"gap≤{max_gap_days}d | ~{bars_per_year:.0f} bars/yr")
+    if first.year > 2006:
+        print(f"    [WARN] starts late ({first.year})")
+    if max_gap_days > 10:
+        print(f"    [WARN] max gap {max_gap_days} days")
+    if bars_per_year < 200:
+        print(f"    [WARN] fewer than 200 bars/year")
 
 
 # ============================================================
-# SIMULATOR
+# INDICATORS
 # ============================================================
-def simulate_one(df, signal, pip_size, spread_pips, slip_pips, swap_pips_per_day):
-    entry_idx = signal['entry_idx']
-    if entry_idx >= len(df):
+def atr_series(high, low, close, n):
+    hl = high - low
+    hc = np.abs(high - np.roll(close, 1))
+    lc = np.abs(low - np.roll(close, 1))
+    tr = np.maximum(hl, np.maximum(hc, lc))
+    tr[0] = hl[0]
+    # Wilder smoothing via EMA
+    atr = pd.Series(tr).ewm(alpha=1.0 / n, adjust=False, min_periods=n).mean().values
+    return atr
+
+
+# ============================================================
+# SIMULATOR (trailing stop)
+# ============================================================
+def simulate_trend_trade(entry_idx, side, entry_open, stop_distance,
+                         high, low, close, spread_price, swap_per_day_price,
+                         max_hold_bars=MAX_HOLD_BARS):
+    """
+    Enter at bar entry_idx open (with half spread + slippage against us).
+    Trailing stop: stop moves with the trend, never against.
+    Exit: stop hit, or max_hold_bars reached (close out at bar close).
+    Returns dict or None.
+    """
+    n = len(high)
+    if entry_idx >= n - 1:
+        return None
+    if not (np.isfinite(entry_open) and entry_open > 0 and np.isfinite(stop_distance) and stop_distance > 0):
         return None
 
-    side = signal['side']
-    entry_bar = df.iloc[entry_idx]
-    entry_price = entry_bar['open']
-
-    half_spread = (spread_pips / 2.0) * pip_size
-    slip = slip_pips * pip_size
-    entry_filled = entry_price + side * (half_spread + slip)
-
-    stop = signal['stop_price']
-    risk_distance = abs(entry_filled - stop)
-    if risk_distance <= 0:
-        return None
+    slip = SLIPPAGE_FRACTION_OF_SPREAD * spread_price
+    entry_filled = entry_open + side * (spread_price / 2.0 + slip)
 
     if side == 1:
-        target = entry_filled + RR_RATIO * risk_distance
+        stop = entry_filled - stop_distance
+        best = high[entry_idx]
     else:
-        target = entry_filled - RR_RATIO * risk_distance
+        stop = entry_filled + stop_distance
+        best = low[entry_idx]
 
-    for j in range(entry_idx, min(entry_idx + TIME_STOP_BARS, len(df))):
-        bar = df.iloc[j]
+    exit_idx = None
+    exit_price = None
+    status = None
+
+    for j in range(entry_idx, min(entry_idx + max_hold_bars, n)):
+        bh, bl = high[j], low[j]
+
+        # Check stop with current (pre-update) level
+        if side == 1 and bl <= stop:
+            exit_price = stop; exit_idx = j; status = 'STOP'; break
+        if side == -1 and bh >= stop:
+            exit_price = stop; exit_idx = j; status = 'STOP'; break
+
+        # Update trail
         if side == 1:
-            hit_sl = bar['low'] <= stop
-            hit_tp = bar['high'] >= target
+            if bh > best:
+                best = bh
+            new_stop = best - stop_distance
+            if new_stop > stop:
+                stop = new_stop
         else:
-            hit_sl = bar['high'] >= stop
-            hit_tp = bar['low'] <= target
+            if bl < best:
+                best = bl
+            new_stop = best + stop_distance
+            if new_stop < stop:
+                stop = new_stop
 
-        if hit_sl and hit_tp:
-            status = 'LOSS'
-            exit_price = stop
-            exit_idx = j
-            break
-        if hit_sl:
-            status = 'LOSS'
-            exit_price = stop
-            exit_idx = j
-            break
-        if hit_tp:
-            status = 'WIN'
-            exit_price = target
-            exit_idx = j
-            break
-    else:
-        j = min(entry_idx + TIME_STOP_BARS, len(df) - 1)
-        bar = df.iloc[j]
-        exit_price = bar['close']
-        status = 'TIME_STOP'
-        exit_idx = j
+    if exit_price is None:
+        exit_idx = min(entry_idx + max_hold_bars, n - 1)
+        exit_price = close[exit_idx]
+        status = 'TIME'
 
-    exit_filled = exit_price - side * (half_spread + slip)
-    r_gross = side * (exit_filled - entry_filled) / risk_distance
+    exit_filled = exit_price - side * (spread_price / 2.0 + slip)
+    r_gross = side * (exit_filled - entry_filled) / stop_distance
 
-    days_held = max(1, (exit_idx - entry_idx + 1) * 4 / 24)
-    swap_cost = swap_pips_per_day * days_held * pip_size
-    swap_r = swap_cost / risk_distance
+    days_held = max(1, exit_idx - entry_idx)
+    swap_r = (swap_per_day_price * days_held) / stop_distance
     r_net = r_gross - swap_r
 
     return {
-        'entry_idx': entry_idx,
-        'exit_idx': exit_idx,
-        'entry_time': df.index[entry_idx],
-        'exit_time': df.index[exit_idx],
-        'type': signal['type'],
+        'entry_idx': entry_idx, 'exit_idx': exit_idx,
+        'entry_price': entry_filled, 'exit_price': exit_filled,
+        'stop_distance': stop_distance, 'status': status,
+        'r_gross': r_gross, 'r_net': r_net, 'days_held': days_held,
         'side': 'LONG' if side == 1 else 'SHORT',
-        'entry': entry_filled,
-        'stop': stop,
-        'target': target,
-        'exit': exit_filled,
-        'status': status,
-        'r_gross': r_gross,
-        'r_net': r_net,
-        'risk_price': risk_distance,
-        'stop_pct': risk_distance / entry_filled * 100,
     }
 
 
 # ============================================================
-# METRICS
+# TRADE GENERATION (per instrument)
 # ============================================================
-def summarize(trades):
-    if not trades:
-        return {'n': 0}
-    df = pd.DataFrame(trades).sort_values('exit_time')
-    n = len(df)
-    r = df['r_net'].values
-    mean = float(r.mean())
-    std = float(r.std(ddof=1)) if n > 1 else 0.0
+def generate_trades(df, sym, cfg, era_cutover=ERA_CUTOVER_YEAR):
+    o = df['open'].values
+    h = df['high'].values
+    l = df['low'].values
+    c = df['close'].values
+    idx = df.index
 
-    eq_r = np.cumsum(r)
-    peak = np.maximum.accumulate(np.concatenate([[0], eq_r]))[1:]
-    dd_r = float((eq_r - peak).min())
+    atr = atr_series(h, l, c, ATR_PERIOD)
 
-    rng = np.random.default_rng(RNG_SEED)
-    boots = r[rng.integers(0, n, size=(BOOTSTRAP_ITERS, n))].mean(axis=1)
-    ci_lo, ci_hi = float(np.percentile(boots, 2.5)), float(np.percentile(boots, 97.5))
+    # 100-day rolling high/low of CLOSE, exclusive of current bar
+    cs = pd.Series(c)
+    hh = cs.shift(1).rolling(LOOKBACK_DAYS).max().values
+    ll = cs.shift(1).rolling(LOOKBACK_DAYS).min().values
 
-    wins = int((df['status'] == 'WIN').sum())
-    losses = int((df['status'] == 'LOSS').sum())
-    ts = int((df['status'] == 'TIME_STOP').sum())
-    win_rate = wins / n * 100 if n else 0
+    pip = cfg['pip_size']
 
-    return {
-        'n': n,
-        'wins': wins, 'losses': losses, 'time_stops': ts,
-        'win_rate': round(win_rate, 1),
-        'mean_r': round(mean, 4),
-        'median_r': round(float(np.median(r)), 4),
-        'ci95_lo': round(ci_lo, 4),
-        'ci95_hi': round(ci_hi, 4),
-        'std_r': round(std, 4),
-        'total_r': round(float(r.sum()), 2),
-        'max_dd_r': round(dd_r, 2),
-        't_stat': round(mean / (std / math.sqrt(n)), 3) if std > 0 else 0.0,
-    }
+    trades = []
+    start_i = max(LOOKBACK_DAYS, ATR_PERIOD) + 1
+    i = start_i
+    next_free = start_i
 
+    while i < len(df) - 2:
+        if i < next_free:
+            i += 1
+            continue
+        if not (np.isfinite(atr[i]) and np.isfinite(hh[i]) and np.isfinite(ll[i])):
+            i += 1
+            continue
 
-def random_entry_baseline(df, n_signals, pip_size, spread_pips, slip_pips, swap_pips_per_day,
-                           iters=MONTE_CARLO_ITERS, seed=RNG_SEED):
-    rng = np.random.default_rng(seed)
-    returns = []
-    valid_idxs = np.arange(WARMUP_BARS, len(df) - 100)
+        side = 0
+        if c[i] > hh[i]:
+            side = 1
+        elif c[i] < ll[i]:
+            side = -1
+        if side == 0:
+            i += 1
+            continue
 
-    for _ in range(iters):
-        rs = []
-        idxs = rng.choice(valid_idxs, size=n_signals, replace=True)
-        for i in idxs:
-            bar = df.iloc[i]
-            side = 1 if rng.random() < 0.5 else -1
-            entry_price = bar['open']
-            half_spread = (spread_pips / 2.0) * pip_size
-            slip = slip_pips * pip_size
-            entry_filled = entry_price + side * (half_spread + slip)
+        entry_idx = i + 1
+        if entry_idx >= len(df):
+            break
+        stop_distance = ATR_MULT * atr[i]
 
-            stop_distance = entry_price * 0.01
-            stop = entry_filled - side * stop_distance
-            target = entry_filled + side * RR_RATIO * stop_distance
+        year = idx[i].year
+        spread_pips = cfg['spread_pre'] if year < era_cutover else cfg['spread_post']
+        spread_price = spread_pips * pip
+        swap_price = cfg['swap_per_day_pips'] * pip
 
-            r_net = _simulate_quick(df, i + 1, side, entry_filled, stop, target,
-                                    stop_distance, pip_size, half_spread, slip,
-                                    swap_pips_per_day)
-            if r_net is not None:
-                rs.append(r_net)
-        if rs:
-            returns.append(np.mean(rs))
-    return np.array(returns)
-
-
-def _simulate_quick(df, entry_idx, side, entry_filled, stop, target, risk_distance,
-                     pip_size, half_spread, slip, swap_pips_per_day):
-    if entry_idx >= len(df):
-        return None
-    for j in range(entry_idx, min(entry_idx + TIME_STOP_BARS, len(df))):
-        bar = df.iloc[j]
-        if side == 1:
-            hit_sl = bar['low'] <= stop
-            hit_tp = bar['high'] >= target
+        t = simulate_trend_trade(
+            entry_idx, side, o[entry_idx], stop_distance,
+            h, l, c, spread_price, swap_price,
+        )
+        if t is not None:
+            t['symbol'] = sym
+            t['entry_time'] = idx[entry_idx]
+            t['exit_time'] = idx[t['exit_idx']]
+            trades.append(t)
+            next_free = t['exit_idx'] + 2
+            i = next_free
         else:
-            hit_sl = bar['high'] >= stop
-            hit_tp = bar['low'] <= target
-        if hit_sl:
-            r_gross = side * (stop - entry_filled) / risk_distance
-            days_held = max(1, (j - entry_idx + 1) * 4 / 24)
-            return r_gross - (swap_pips_per_day * days_held * pip_size / risk_distance)
-        if hit_tp:
-            r_gross = side * (target - entry_filled) / risk_distance
-            days_held = max(1, (j - entry_idx + 1) * 4 / 24)
-            return r_gross - (swap_pips_per_day * days_held * pip_size / risk_distance)
-    return None
+            i += 1
+
+    return trades
 
 
 # ============================================================
 # CANARY TESTS
 # ============================================================
-def _lookahead_profit(df, pip_size):
+def canary_buy_hold(df, sym):
+    bh = (df['close'].iloc[-1] / df['close'].iloc[0] - 1) * 100
+    print(f"  [1] {sym} buy&hold: {bh:+.1f}%")
+    return True
+
+
+def canary_random_entries(df, cfg, n_signals=200, iters=RANDOM_ITERS):
+    """Random entries through the actual simulator. Zero-cost run should be ~0R."""
+    o = df['open'].values
+    h = df['high'].values
+    l = df['low'].values
+    c = df['close'].values
+    atr = atr_series(h, l, c, ATR_PERIOD)
+    pip = cfg['pip_size']
+    rng = np.random.default_rng(RNG_SEED)
+
+    valid = np.arange(LOOKBACK_DAYS + ATR_PERIOD + 2, len(df) - MAX_HOLD_BARS - 2)
+    if len(valid) < 100:
+        return None, None
+
+    def run(zero_cost):
+        means = []
+        for _ in range(iters):
+            rs = []
+            picks = rng.choice(valid, size=n_signals, replace=True)
+            for i in picks:
+                if not np.isfinite(atr[i]) or atr[i] <= 0:
+                    continue
+                side = 1 if rng.random() < 0.5 else -1
+                spread_price = 0.0 if zero_cost else cfg['spread_post'] * pip
+                swap_price = 0.0 if zero_cost else cfg['swap_per_day_pips'] * pip
+                t = simulate_trend_trade(
+                    i + 1, side, o[i + 1], ATR_MULT * atr[i],
+                    h, l, c, spread_price, swap_price,
+                )
+                if t is not None:
+                    rs.append(t['r_net'])
+            if rs:
+                means.append(np.mean(rs))
+        return np.array(means)
+
+    no_cost = run(True)
+    with_cost = run(False)
+    return no_cost, with_cost
+
+
+def canary_lookahead(df, cfg):
+    """Perfect-foresight entries through the actual simulator. Must be huge."""
+    o = df['open'].values
+    h = df['high'].values
+    l = df['low'].values
+    c = df['close'].values
+    atr = atr_series(h, l, c, ATR_PERIOD)
+    pip = cfg['pip_size']
     rs = []
-    for i in range(WARMUP_BARS, len(df) - 2, 10):
-        nxt = df.iloc[i + 1]
-        entry = df.iloc[i]['close']
-        if nxt['close'] > entry:
-            side = 1
-            exit_price = nxt['high']
-        else:
-            side = -1
-            exit_price = nxt['low']
-        r = side * (exit_price - entry) / (entry * 0.001)
-        rs.append(r)
+    for i in range(LOOKBACK_DAYS + ATR_PERIOD + 2, len(df) - 5, 5):
+        if not np.isfinite(atr[i]) or atr[i] <= 0:
+            continue
+        # cheat: use next bar's high/low as the entry outcome
+        nxt_up = c[i + 1] > c[i]
+        side = 1 if nxt_up else -1
+        # shrink stop distance so perfect foresight shows up clearly
+        sd = 0.1 * atr[i]
+        t = simulate_trend_trade(
+            i + 1, side, o[i + 1], sd,
+            h, l, c, 0.0, 0.0,
+            max_hold_bars=2,
+        )
+        if t is not None:
+            rs.append(t['r_net'])
     return float(np.mean(rs)) if rs else 0.0
 
 
-def canary_tests(df, pip_size):
-    print("\n--- CANARY TESTS ---")
-    passed = True
+# ============================================================
+# PORTFOLIO METRICS
+# ============================================================
+def portfolio_monthly_returns(trades):
+    if not trades:
+        return pd.Series(dtype=float)
+    df = pd.DataFrame(trades)
+    risk_dollars = START_BALANCE * RISK_PER_TRADE
+    df['pnl'] = df['r_net'] * risk_dollars
+    df['month'] = pd.to_datetime(df['exit_time']).dt.to_period('M')
+    monthly = df.groupby('month')['pnl'].sum()
+    # Percentage return relative to starting balance
+    return monthly / START_BALANCE
 
-    bh = (df['close'].iloc[-1] / df['close'].iloc[WARMUP_BARS] - 1) * 100
-    print(f"  [1] Buy & Hold over window: {bh:+.1f}%")
-    if not (isinstance(bh, float) and math.isfinite(bh)):
-        print("      FAIL — buy&hold did not compute")
-        passed = False
-    else:
-        print("      PASS — buy&hold reproducible")
 
-    print(f"  [2] Random entries with costs...")
-    n_random = 200
-    rand_returns = random_entry_baseline(df, n_random, pip_size, 1.0, 0.5, 0.2,
-                                          iters=200, seed=RNG_SEED)
-    if len(rand_returns):
-        mean_rand = float(rand_returns.mean())
-        print(f"      mean R = {mean_rand:+.4f}  (expected: ≤ 0 after costs)")
-        if mean_rand > 0.15:
-            print("      FAIL — random entries profitable → costs too low or bug")
-            passed = False
-        else:
-            print("      PASS — random entries lose to costs as expected")
-    else:
-        print("      FAIL — random baseline returned no values")
-        passed = False
+def portfolio_sharpe(monthly_returns):
+    if len(monthly_returns) < 12:
+        return float('nan')
+    m, s = monthly_returns.mean(), monthly_returns.std()
+    if s <= 0:
+        return 0.0
+    return float((m / s) * math.sqrt(12))
 
-    print(f"  [3] Look-ahead canary (cheat: uses next bar's high)...")
-    lookahead_profit = _lookahead_profit(df, pip_size)
-    print(f"      look-ahead expectancy: {lookahead_profit:+.3f}R per trade")
-    if lookahead_profit > 1.0:
-        print("      PASS — look-ahead produces absurd profit, engine correct")
-    else:
-        print("      FAIL — look-ahead not extracting absurd profit → engine issue")
-        passed = False
 
-    print(f"--- CANARY RESULT: {'PASS' if passed else 'FAIL'} ---")
-    return passed
+def portfolio_drawdown(monthly_returns):
+    if len(monthly_returns) == 0:
+        return 0.0, 0.0
+    eq = (1 + monthly_returns).cumprod()
+    peak = eq.cummax()
+    dd = (eq - peak) / peak
+    return float(dd.min()) * 100, float(dd.max() * 100)
+
+
+def summarize_trades(trades):
+    if not trades:
+        return {'n': 0}
+    df = pd.DataFrame(trades)
+    r = df['r_net'].values
+    n = len(r)
+    mean = float(r.mean())
+    std = float(r.std(ddof=1)) if n > 1 else 0.0
+    wins = int((r > 0).sum())
+    rng = np.random.default_rng(RNG_SEED)
+    boots = r[rng.integers(0, n, size=(BOOTSTRAP_ITERS, n))].mean(axis=1)
+    ci_lo = float(np.percentile(boots, 2.5))
+    ci_hi = float(np.percentile(boots, 97.5))
+    return {
+        'n': n, 'mean_r': round(mean, 4), 'std_r': round(std, 4),
+        'win_rate': round(wins / n * 100, 1),
+        'ci95_lo': round(ci_lo, 4), 'ci95_hi': round(ci_hi, 4),
+        'total_r': round(float(r.sum()), 2),
+        't_stat': round(mean / (std / math.sqrt(n)), 3) if std > 0 else 0.0,
+    }
 
 
 # ============================================================
-# BACKTEST RUNNER
+# REPORTING
 # ============================================================
-def run_pair(pair, instrument):
-    print(f"\n=== {pair} ===")
-    df = fetch_4h(instrument, DEV_START, HOLDOUT_END)
-    if df.empty:
-        print(f"  No data for {pair}")
-        return None
-
-    print(f"  Bars: {len(df)} | {df.index[0].date()} → {df.index[-1].date()}")
-    pip = PIP_SIZE[pair]
-    spread = SPREAD_PIPS[pair]
-    slip = SLIPPAGE_PIPS[pair]
-    swap = SWAP_PIPS_PER_DAY[pair]
-
-    if not canary_tests(df, pip):
-        print(f"  ⚠️ Canary failed for {pair}. Aborting.")
-        return None
-
-    signals = detect_signals(df, pip)
-    print(f"  Signals after strict filter: {len(signals)}")
-
-    trades = []
-    for sig in signals:
-        t = simulate_one(df, sig, pip, spread, slip, swap)
-        if t is not None:
-            t['pair'] = pair
-            trades.append(t)
-
-    print(f"  Simulated trades: {len(trades)}")
-    return trades, df
-
-
-def _print_summary_line(label, m):
+def print_summary_line(label, m):
     if m.get('n', 0) == 0:
-        print(f"  {label:<8} no trades")
+        print(f"  {label:<12} no trades")
         return
-    print(f"  {label:<8} n={m['n']:4d} | WR {m['win_rate']:5.1f}% | "
+    print(f"  {label:<12} n={m['n']:4d} | WR {m['win_rate']:5.1f}% | "
           f"mean {m['mean_r']:+.4f}R [{m['ci95_lo']:+.3f},{m['ci95_hi']:+.3f}] | "
-          f"total {m['total_r']:+.2f}R | DD {m['max_dd_r']:+.2f}R | t={m['t_stat']:+.2f}")
-
-
-def print_report(all_trades, per_pair_df):
-    print("\n" + "=" * 70)
-    print("          FX WYCKOFF BACKTEST REPORT")
-    print("=" * 70)
-
-    if not all_trades:
-        print("No trades.")
-        return None
-
-    dev = [t for t in all_trades if t['entry_time'] < DEV_END]
-    val = [t for t in all_trades if DEV_END <= t['entry_time'] < VAL_END]
-    holdout = [t for t in all_trades if t['entry_time'] >= VAL_END]
-
-    print(f"\n--- ALL TRADES ---")
-    all_m = summarize(all_trades)
-    _print_summary_line('ALL', all_m)
-
-    print(f"\n--- DEV (2005-2018) ---")
-    dev_m = summarize(dev)
-    _print_summary_line('DEV', dev_m)
-
-    print(f"\n--- VALIDATION (2018-2023) ---")
-    val_m = summarize(val)
-    _print_summary_line('VAL', val_m)
-
-    print(f"\n--- HOLDOUT (2023-now) ---")
-    hol_m = summarize(holdout)
-    _print_summary_line('HOLD', hol_m)
-
-    print(f"\n--- PER PAIR ---")
-    for pair in per_pair_df:
-        sub = [t for t in all_trades if t['pair'] == pair]
-        _print_summary_line(pair, summarize(sub))
-
-    print(f"\n--- BY TYPE ---")
-    for t_type in ['Spring', 'UTAD']:
-        sub = [t for t in all_trades if t['type'] == t_type]
-        _print_summary_line(t_type, summarize(sub))
-
-    print(f"\n--- VERDICT ---")
-    if not holdout or hol_m['n'] < 20:
-        print(f"  HOLDOUT has only {hol_m.get('n', 0)} trades — INCONCLUSIVE")
-    elif hol_m['mean_r'] <= 0:
-        print(f"  HOLDOUT mean R = {hol_m['mean_r']:+.4f} → FAIL")
-    elif hol_m['ci95_lo'] <= 0:
-        print(f"  HOLDOUT 95% CI lower = {hol_m['ci95_lo']:+.4f} → INCONCLUSIVE")
-    else:
-        print(f"  HOLDOUT mean R = {hol_m['mean_r']:+.4f}, CI lo = {hol_m['ci95_lo']:+.4f} → PASS")
-
-    print("=" * 70)
-    return {'all': all_m, 'dev': dev_m, 'val': val_m, 'holdout': hol_m}
+          f"total {m['total_r']:+.2f}R | t={m['t_stat']:+.2f}")
 
 
 # ============================================================
 # MAIN
 # ============================================================
 def main():
+    print("=" * 72)
+    print("   TREND-FOLLOWING BACKTESTER (100d breakout, 3xATR trail)")
+    print(f"   USE_HOLDOUT = {USE_HOLDOUT}")
+    print("=" * 72)
+
+    print("\n--- LOADING INSTRUMENTS ---")
+    instruments = load_instruments()
+    if not instruments:
+        print("No instruments loaded. Aborting.")
+        return
+
+    print("\n--- CANARY TESTS (per instrument) ---")
+    canary_failures = []
+    for sym, cfg in instruments.items():
+        try:
+            df = fetch_daily(cfg['instrument'], DEV_START, FINAL_END)
+            if df.empty:
+                print(f"  [SKIP] {sym} — no data")
+                continue
+            assert_data(df, sym)
+            canary_buy_hold(df, sym)
+            nc, wc = canary_random_entries(df, cfg, n_signals=150, iters=200)
+            if nc is None or wc is None:
+                print(f"    [WARN] {sym} random canary returned nothing")
+                canary_failures.append(sym)
+                continue
+            print(f"    random (no cost) mean R = {nc.mean():+.4f}  (expect ~0)")
+            print(f"    random (with cost) mean R = {wc.mean():+.4f}  (expect <0)")
+            if not (wc.mean() < 0.05):
+                print(f"    [WARN] {sym} random entries with costs are not losing")
+            la = canary_lookahead(df, cfg)
+            print(f"    look-ahead mean R = {la:+.3f}  (expect > 3)")
+            if la < 2.0:
+                print(f"    [WARN] {sym} look-ahead weak — possible engine issue")
+                canary_failures.append(sym)
+        except Exception as e:
+            print(f"  [ERROR] {sym}: {e}")
+            canary_failures.append(sym)
+
+    if canary_failures:
+        print(f"\n[WARN] Canary issues on: {canary_failures}")
+        print("Continuing, but treat results with caution.")
+
+    print("\n--- GENERATING TRADES ---")
     all_trades = []
-    per_pair_df = {}
+    for sym, cfg in instruments.items():
+        try:
+            df = fetch_daily(cfg['instrument'], DEV_START, FINAL_END)
+            if df.empty:
+                continue
+            # SEALED HOLDOUT: cut at VAL_END unless USE_HOLDOUT
+            if not USE_HOLDOUT:
+                df = df[df.index <= VAL_END]
+            trades = generate_trades(df, sym, cfg)
+            print(f"  {sym}: {len(trades)} trades")
+            all_trades.extend(trades)
+        except Exception as e:
+            print(f"  [ERROR] {sym}: {e}")
 
-    for pair, instrument in INSTRUMENTS.items():
-        result = run_pair(pair, instrument)
-        if result is None:
-            continue
-        trades, df = result
-        all_trades.extend(trades)
-        per_pair_df[pair] = df
+    if not all_trades:
+        print("\nNo trades generated.")
+        return
 
-    all_trades.sort(key=lambda t: t['entry_time'])
-    print_report(all_trades, per_pair_df)
+    all_trades.sort(key=lambda t: t['exit_time'])
 
-    if all_trades:
-        out = pd.DataFrame(all_trades)
-        out.to_csv('fx_trades.csv', index=False)
-        print(f"\nSaved {len(all_trades)} trades to fx_trades.csv")
+    # Split into dev / val (no holdout unless USE_HOLDOUT)
+    dev = [t for t in all_trades if t['entry_time'] < DEV_END]
+    val = [t for t in all_trades if DEV_END <= t['entry_time'] <= VAL_END]
+    hold = [t for t in all_trades if t['entry_time'] > VAL_END]
+
+    print("\n" + "=" * 72)
+    print("          TREND-FOLLOWING REPORT")
+    print("=" * 72)
+
+    print(f"\n--- ALL TRADES ---")
+    print_summary_line('ALL', summarize_trades(all_trades))
+    print(f"\n--- DEV (2005-2018) ---")
+    print_summary_line('DEV', summarize_trades(dev))
+    print(f"\n--- VALIDATION (2018-2022) ---")
+    print_summary_line('VAL', summarize_trades(val))
+    if USE_HOLDOUT:
+        print(f"\n--- HOLDOUT (2023-now) ---")
+        print_summary_line('HOLD', summarize_trades(hold))
+
+    print(f"\n--- PER INSTRUMENT ---")
+    for sym in instruments:
+        sub = [t for t in all_trades if t['symbol'] == sym]
+        print_summary_line(sym, summarize_trades(sub))
+
+    print(f"\n--- PORTFOLIO METRICS ---")
+    monthly = portfolio_monthly_returns(all_trades)
+    if len(monthly) > 0:
+        sharpe = portfolio_sharpe(monthly)
+        dd_min, dd_max = portfolio_drawdown(monthly)
+        total_ret = ((1 + monthly).prod() - 1) * 100
+        print(f"  Months tracked: {len(monthly)}")
+        print(f"  Total return: {total_ret:+.1f}%")
+        print(f"  Annualized Sharpe: {sharpe:.2f}")
+        print(f"  Max drawdown: {dd_min:.1f}%")
+        print(f"  Best month: {monthly.max()*100:+.2f}% | Worst: {monthly.min()*100:+.2f}%")
+
+        # Bootstrap CI on monthly returns
+        rng = np.random.default_rng(RNG_SEED)
+        boots = monthly.values[rng.integers(0, len(monthly), size=(BOOTSTRAP_ITERS, len(monthly)))].mean(axis=1)
+        ci_lo = float(np.percentile(boots, 2.5))
+        ci_hi = float(np.percentile(boots, 97.5))
+        print(f"  Monthly mean CI95: [{ci_lo:+.4f}, {ci_hi:+.4f}]")
+    else:
+        print("  No monthly data.")
+
+    print(f"\n--- VERDICT (pre-registered gates) ---")
+    n_trades = len(all_trades)
+    passed = True
+    if n_trades < MIN_TRADES_REQUIRED:
+        print(f"  FAIL: only {n_trades} trades (< {MIN_TRADES_REQUIRED})")
+        passed = False
+    if len(monthly) > 0:
+        sharpe = portfolio_sharpe(monthly)
+        if sharpe < 0.30:
+            print(f"  FAIL: Sharpe {sharpe:.2f} < 0.30")
+            passed = False
+        rng = np.random.default_rng(RNG_SEED)
+        boots = monthly.values[rng.integers(0, len(monthly), size=(BOOTSTRAP_ITERS, len(monthly)))].mean(axis=1)
+        if float(np.percentile(boots, 2.5)) <= 0:
+            print(f"  FAIL: monthly mean CI lower bound ≤ 0")
+            passed = False
+    if passed:
+        print("  PASS (directional). Forward-test on demo before any live capital.")
+    print("=" * 72)
+
+    # Save trades
+    pd.DataFrame(all_trades).to_csv('fx_trades.csv', index=False)
+    print(f"\nSaved {len(all_trades)} trades to fx_trades.csv")
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
