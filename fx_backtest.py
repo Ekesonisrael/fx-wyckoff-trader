@@ -45,10 +45,11 @@ STARTING_BALANCE = 10_000.0
 RISK_PER_TRADE = 0.01
 LEVERAGE_CAP = 3.0
 
-DEV_START = dt.datetime(2005, 1, 1)
-DEV_END = dt.datetime(2018, 1, 1)
-VAL_END = dt.datetime(2023, 1, 1)
-HOLDOUT_END = dt.datetime.now()
+# Timezone-aware split dates (fix: Dukascopy returns tz-aware timestamps)
+DEV_START = dt.datetime(2005, 1, 1, tzinfo=dt.timezone.utc)
+DEV_END = dt.datetime(2018, 1, 1, tzinfo=dt.timezone.utc)
+VAL_END = dt.datetime(2023, 1, 1, tzinfo=dt.timezone.utc)
+HOLDOUT_END = dt.datetime.now(tz=dt.timezone.utc)
 
 GATES = {
     'min_oos_trades': 100,
@@ -78,7 +79,7 @@ def fetch_4h(instrument, start, end):
     if df is None or df.empty:
         return pd.DataFrame()
     df = df.copy()
-    df.index = pd.to_datetime(df.index)
+    df.index = pd.to_datetime(df.index, utc=True)
     df = df[['open', 'high', 'low', 'close', 'volume']].dropna()
     df = df[~df.index.duplicated(keep='last')].sort_index()
     return df
@@ -354,9 +355,6 @@ def _simulate_quick(df, entry_idx, side, entry_filled, stop, target, risk_distan
 # CANARY TESTS
 # ============================================================
 def _lookahead_profit(df, pip_size):
-    """Cheat by peeking one bar ahead to pick direction.
-    Uses 0.1% risk denominator so perfect foresight on a typical
-    4H bar produces a large R value (calibration, not real edge)."""
     rs = []
     for i in range(WARMUP_BARS, len(df) - 2, 10):
         nxt = df.iloc[i + 1]
